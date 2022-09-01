@@ -11,7 +11,7 @@ from bentoml.exceptions import BentoMLException
 from ..tag import Tag
 from ..models import Model
 from ..runner import Runner
-from ..bento.bento import get_default_bento_readme
+from ..bento.bento import get_default_svc_readme
 from .inference_api import InferenceAPI
 from ..io_descriptors import IODescriptor
 
@@ -48,13 +48,6 @@ def add_inference_api(
     if api.name in svc.apis:
         raise BentoMLException(
             f"API {api.name} is already defined in Service {svc.name}"
-        )
-
-    from ..io_descriptors import Multipart
-
-    if isinstance(output, Multipart):
-        logger.warning(
-            f"Found Multipart as the output of API '{api.name}'. Multipart responses are rarely used in the real world, and few clients/browsers support it. Make sure you know what you are doing."
         )
 
     svc.apis[api.name] = api
@@ -190,7 +183,7 @@ class Service:
         if self.bento is not None:
             return self.bento.doc
 
-        return get_default_bento_readme(self)
+        return get_default_svc_readme(self)
 
     @property
     def openapi_spec(self) -> OpenAPISpecification:

@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import os
 import uuid
 import typing as t
@@ -20,6 +22,7 @@ from deepmerge.merger import Merger
 
 from . import expand_env_var
 from ..utils import validate_or_create_dir
+from ..context import component_context
 from ..resource import system_resources
 from ...exceptions import BentoMLConfigException
 
@@ -42,11 +45,27 @@ config_merger = Merger(
 
 logger = logging.getLogger(__name__)
 
-_check_tracing_type: t.Callable[[str], bool] = lambda s: s in ("zipkin", "jaeger")
-_larger_than: t.Callable[[int], t.Callable[[int], bool]] = (
+_check_tracing_type: t.Callable[[str], bool] = lambda s: s in (
+    "zipkin",
+    "jaeger",
+    "otlp",
+)
+_check_otlp_protocol: t.Callable[[str], bool] = lambda s: s in (
+    "grpc",
+    "http",
+)
+_check_sample_rate: t.Callable[[float], None] = (
+    lambda sample_rate: logger.warning(
+        "Tracing enabled, but sample_rate is unset or zero. No traces will be collected. "
+        "Please refer to https://docs.bentoml.org/en/latest/guides/tracing.html for more details."
+    )
+    if sample_rate == 0.0
+    else None
+)
+_larger_than: t.Callable[[int | float], t.Callable[[int | float], bool]] = (
     lambda target: lambda val: val > target
 )
-_larger_than_zero: t.Callable[[int], bool] = _larger_than(0)
+_larger_than_zero: t.Callable[[int | float], bool] = _larger_than(0)
 
 
 def _is_ip_address(addr: str) -> bool:
@@ -78,6 +97,7 @@ RUNNER_CFG_SCHEMA = {
             Optional("response_content_type"): Or(bool, None),
         },
     },
+    Optional("timeout"): And(int, _larger_than_zero),
 }
 
 SCHEMA = Schema(
@@ -90,15 +110,23 @@ SCHEMA = Schema(
             "timeout": And(int, _larger_than_zero),
             "max_request_size": And(int, _larger_than_zero),
             Optional("ssl"): {
-                Optional("keyfile"): Or(str, None),
                 Optional("certfile"): Or(str, None),
+                Optional("keyfile"): Or(str, None),
                 Optional("keyfile_password"): Or(str, None),
                 Optional("version"): Or(And(int, _larger_than_zero), None),
                 Optional("cert_reqs"): Or(int, None),
                 Optional("ca_certs"): Or(str, None),
                 Optional("ciphers"): Or(str, None),
             },
-            "metrics": {"enabled": bool, "namespace": str},
+            "metrics": {
+                "enabled": bool,
+                "namespace": str,
+                Optional("duration"): {
+                    Optional("min"): And(float, _larger_than_zero),
+                    Optional("max"): And(float, _larger_than_zero),
+                    Optional("factor"): And(float, _larger_than(1.0)),
+                },
+            },
             "logging": {
                 # TODO add logging level configuration
                 "access": {
@@ -129,6 +157,10 @@ SCHEMA = Schema(
             "excluded_urls": Or([str], str, None),
             Optional("zipkin"): {"url": Or(str, None)},
             Optional("jaeger"): {"address": Or(str, None), "port": Or(int, None)},
+            Optional("otlp"): {
+                "protocol": Or(And(str, Use(str.lower), _check_otlp_protocol), None),
+                "url": Or(str, None),
+            },
         },
         Optional("yatai"): {
             "default_server": Or(str, None),
@@ -185,10 +217,10 @@ class BentoMLConfiguration:
 
             global_runner_cfg = {
                 k: self.config["runners"][k]
-                for k in ("batching", "resources", "logging")
+                for k in ("batching", "resources", "logging", "timeout")
             }
             for key in self.config["runners"]:
-                if key not in ["batching", "resources", "logging"]:
+                if key not in ["batching", "resources", "logging", "timeout"]:
                     runner_cfg = self.config["runners"][key]
 
                     # key is a runner name
@@ -293,7 +325,7 @@ class _BentoMLContainerClass:
 
     @providers.SingletonFactory
     @staticmethod
-    def serve_info() -> "ServeInfo":
+    def serve_info() -> ServeInfo:
         from ..utils.analytics import get_serve_info
 
         return get_serve_info()
@@ -364,23 +396,44 @@ class _BentoMLContainerClass:
         zipkin_server_url: t.Optional[str] = Provide[config.tracing.zipkin.url],
         jaeger_server_address: t.Optional[str] = Provide[config.tracing.jaeger.address],
         jaeger_server_port: t.Optional[int] = Provide[config.tracing.jaeger.port],
+        otlp_server_protocol: t.Optional[str] = Provide[config.tracing.otlp.protocol],
+        otlp_server_url: t.Optional[str] = Provide[config.tracing.otlp.url],
     ):
         from opentelemetry.sdk.trace import TracerProvider
+        from opentelemetry.sdk.resources import Resource
+        from opentelemetry.sdk.resources import SERVICE_NAME
+        from opentelemetry.sdk.resources import SERVICE_VERSION
+        from opentelemetry.sdk.resources import SERVICE_NAMESPACE
+        from opentelemetry.sdk.resources import SERVICE_INSTANCE_ID
         from opentelemetry.sdk.trace.export import BatchSpanProcessor
+        from opentelemetry.sdk.environment_variables import OTEL_SERVICE_NAME
+        from opentelemetry.sdk.environment_variables import OTEL_RESOURCE_ATTRIBUTES
 
         from ..utils.telemetry import ParentBasedTraceIdRatio
 
         if sample_rate is None:
             sample_rate = 0.0
 
+        resource = {}
+
+        # User can optionally configure the resource with the following environment variables. Only
+        # configure resource if user has not explicitly configured it.
+        if (
+            OTEL_SERVICE_NAME not in os.environ
+            and OTEL_RESOURCE_ATTRIBUTES not in os.environ
+        ):
+            if component_context.component_name:
+                resource[SERVICE_NAME] = component_context.component_name
+            if component_context.component_index:
+                resource[SERVICE_INSTANCE_ID] = component_context.component_index
+            if component_context.bento_name:
+                resource[SERVICE_NAMESPACE] = component_context.bento_name
+            if component_context.bento_version:
+                resource[SERVICE_VERSION] = component_context.bento_version
+
         provider = TracerProvider(
             sampler=ParentBasedTraceIdRatio(sample_rate),
-            # resource: Resource = Resource.create({}),
-            # shutdown_on_exit: bool = True,
-            # active_span_processor: Union[
-            # SynchronousMultiSpanProcessor, ConcurrentMultiSpanProcessor
-            # ] = None,
-            # id_generator: IdGenerator = None,
+            resource=Resource.create(resource),
         )
 
         if tracer_type == "zipkin" and zipkin_server_url is not None:
@@ -393,6 +446,7 @@ class _BentoMLContainerClass:
                 endpoint=zipkin_server_url,
             )
             provider.add_span_processor(BatchSpanProcessor(exporter))  # type: ignore (no opentelemetry types)
+            _check_sample_rate(sample_rate)
             return provider
         elif (
             tracer_type == "jaeger"
@@ -409,6 +463,30 @@ class _BentoMLContainerClass:
                 agent_port=jaeger_server_port,
             )
             provider.add_span_processor(BatchSpanProcessor(exporter))  # type: ignore (no opentelemetry types)
+            _check_sample_rate(sample_rate)
+            return provider
+        elif (
+            tracer_type == "otlp"
+            and otlp_server_protocol is not None
+            and otlp_server_url is not None
+        ):
+            if otlp_server_protocol == "grpc":
+                # pylint: disable=no-name-in-module # https://github.com/open-telemetry/opentelemetry-python-contrib/issues/290
+                from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import (
+                    OTLPSpanExporter,  # type: ignore (no opentelemetry types)
+                )
+
+            elif otlp_server_protocol == "http":
+                # pylint: disable=no-name-in-module # https://github.com/open-telemetry/opentelemetry-python-contrib/issues/290
+                from opentelemetry.exporter.otlp.proto.http.trace_exporter import (
+                    OTLPSpanExporter,  # type: ignore (no opentelemetry types)
+                )
+
+            exporter = OTLPSpanExporter(  # type: ignore (no opentelemetry types)
+                endpoint=otlp_server_url,
+            )
+            provider.add_span_processor(BatchSpanProcessor(exporter))  # type: ignore (no opentelemetry types)
+            _check_sample_rate(sample_rate)
             return provider
         else:
             return provider
@@ -431,6 +509,31 @@ class _BentoMLContainerClass:
     # Mapping from runner name to RunnerApp file descriptor
     remote_runner_mapping = providers.Static[t.Dict[str, str]]({})
     plasma_db = providers.Static[t.Optional["ext.PlasmaClient"]](None)
+
+    @providers.SingletonFactory
+    @staticmethod
+    def duration_buckets(
+        metrics: dict[str, t.Any] = Provide[config.api_server.metrics],
+    ) -> tuple[float, ...]:
+        """
+        Returns a tuple of duration buckets in seconds. If not explicitly configured,
+        the Prometheus default is returned; otherwise, a set of exponential buckets
+        generated based on the configuration is returned.
+        """
+        from ..utils.metrics import DEFAULT_BUCKET
+        from ..utils.metrics import exponential_buckets
+
+        if "duration" in metrics:
+            duration: dict[str, float] = metrics["duration"]
+            if duration.keys() >= {"min", "max", "factor"}:
+                return exponential_buckets(
+                    duration["min"], duration["factor"], duration["max"]
+                )
+            raise BentoMLConfigException(
+                "Keys 'min', 'max', and 'factor' are required for "
+                f"'duration' configuration, '{duration}'."
+            )
+        return DEFAULT_BUCKET
 
 
 BentoMLContainer = _BentoMLContainerClass()

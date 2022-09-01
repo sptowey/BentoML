@@ -49,6 +49,9 @@ class RunnerAppFactory(BaseAppFactory):
             if not method.config.batchable:
                 continue
             self.dispatchers[method.name] = CorkDispatcher(
+                runner_name=runner.name,
+                worker_index=worker_index,
+                method_name=method.name,
                 max_latency_in_ms=method.max_latency_ms,
                 max_batch_size=method.max_batch_size,
                 fallback=TooManyRequests,
@@ -62,13 +65,6 @@ class RunnerAppFactory(BaseAppFactory):
     def on_startup(self) -> t.List[t.Callable[[], None]]:
         on_startup = super().on_startup
         on_startup.insert(0, functools.partial(self.runner.init_local, quiet=True))
-        on_startup.insert(
-            0,
-            functools.partial(
-                self.runner.setup_worker,
-                worker_id=self.worker_index,
-            ),
-        )
         return on_startup
 
     @property
@@ -217,16 +213,30 @@ class RunnerAppFactory(BaseAppFactory):
             params = pickle.loads(await request.body())
 
             params = params.map(AutoContainer.from_payload)
-            ret = await runner_method.async_run(*params.args, **params.kwargs)
 
-            payload = AutoContainer.to_payload(ret, 0)
-            return Response(
-                payload.data,
-                headers={
-                    PAYLOAD_META_HEADER: json.dumps(payload.meta),
-                    "Content-Type": f"application/vnd.bentoml.{payload.container}",
-                    "Server": f"BentoML-Runner/{self.runner.name}/{runner_method.name}/{self.worker_index}",
-                },
-            )
+            try:
+                ret = await runner_method.async_run(*params.args, **params.kwargs)
+            except BaseException as exc:
+                logger.error(
+                    f"Exception on runner '{runner_method.runner.name}' method '{runner_method.name}'",
+                    exc_info=exc,
+                )
+                return Response(
+                    status_code=500,
+                    headers={
+                        "Content-Type": "text/plain",
+                        "Server": f"BentoML-Runner/{self.runner.name}/{runner_method.name}/{self.worker_index}",
+                    },
+                )
+            else:
+                payload = AutoContainer.to_payload(ret, 0)
+                return Response(
+                    payload.data,
+                    headers={
+                        PAYLOAD_META_HEADER: json.dumps(payload.meta),
+                        "Content-Type": f"application/vnd.bentoml.{payload.container}",
+                        "Server": f"BentoML-Runner/{self.runner.name}/{runner_method.name}/{self.worker_index}",
+                    },
+                )
 
         return _run
